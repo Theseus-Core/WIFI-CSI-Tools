@@ -13,7 +13,7 @@ class CSITester:
             print(f"[!] 无法打开串口: {e}")
             sys.exit(1)
 
-    def generate_csi_data(self, length=20, min_val=-50, max_val=50):
+    def generate_csi_data(self, length=224, min_val=0, max_val=50):
         """生成模拟的 CSI 数组字符串"""
         data_array = [random.randint(min_val, max_val) for _ in range(length)]
         return f"type:CSI,rssi:-65,data:{data_array}\n"
@@ -48,7 +48,7 @@ class CSITester:
         try:
             count = 0
             while True:
-                payload = self.generate_csi_data(length=64)
+                payload = self.generate_csi_data(length=224)
                 self.ser.write(payload.encode('utf-8'))
                 count += 1
                 if count % 10 == 0:
@@ -63,7 +63,7 @@ def main():
     parser.add_argument("-b", "--baud", type=int, default=115200, help="波特率 (默认: 115200)")
     parser.add_argument("-m", "--mode", choices=['once', 'sim'], default='once', 
                         help="模式: once (单次全用例测试), sim (实时持续模拟)")
-    parser.add_argument("-i", "--interval", type=float, default=0.05, help="模拟模式下的发送间隔 (秒)")
+    parser.add_argument("-i", "--interval", type=float, default=0.02, help="模拟模式下的发送间隔 (秒)")
 
     args = parser.parse_args()
 
