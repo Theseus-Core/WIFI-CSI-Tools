@@ -4,173 +4,115 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/tarm/serial"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// App struct
+type DataPacket struct {
+	Data      []int16   `json:"data"`
+	Amplitude []float32 `json:"amplitude"`
+	Phase     []float32 `json:"phase"`
+}
+
 type App struct {
-	ctx          context.Context
-	cancelFunc   context.CancelFunc
-	serialConfig serial.Config
-	mu           sync.Mutex
-}
-type CSIFrame struct {
-	Rssi      int       `json:"rssi"`
-	Index     int       `json:"index"`
-	Len       int       `json:"len"`
-	Raw       []int     `json:"raw"`       // 256个原始整数
-	Amplitude []float64 `json:"amplitude"` // 幅度
-	Phase     []float64 `json:"phase"`     // 相位
+	ctx        context.Context
+	portStream io.ReadWriteCloser
+	mu         sync.Mutex // 保证串口操作安全
 }
 
-var csiRegex = regexp.MustCompile(`rssi:(-?\d+)\s+index:(\d+)\s+len:(\d+)\s+data:\[(.*?)\]`)
+func NewApp() *App { return &App{} }
 
-var config = &serial.Config{
-	Name:        "COM30",
-	Baud:        115200,
-	ReadTimeout: time.Second * 1,
-}
+func (a *App) startup(ctx context.Context) { a.ctx = ctx }
 
-// NewApp creates a new App application struct
-func NewApp() *App {
-	return &App{}
-}
-
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-	a.serialConfig = *config // 初始化默认配置
-	a.Reconnect()
-}
-
-// Greet returns a greeting for the given name
-func (a *App) Greet(name string) string {
-	return fmt.Sprintf("你好 Hello %s, It's show time!", name)
-}
-
-// Reconnect 串口连接
-func (a *App) Reconnect() {
+// OpenSerialPort 打开串口
+func (a *App) OpenSerialPort(portName string, baudRate int) string {
 	a.mu.Lock()
-	// 1. 如果已有协程在运行，先停止它
-	if a.cancelFunc != nil {
-		a.cancelFunc()
-		time.Sleep(2 * time.Second) // 给一点时间让旧串口完成释放
+	defer a.mu.Unlock()
+
+	if a.portStream != nil {
+		return "串口已在运行中"
 	}
 
-	// 2. 创建新的 Context
-	subCtx, cancel := context.WithCancel(context.Background())
-	a.cancelFunc = cancel
-	a.mu.Unlock()
-	// 3. 启动新协程
-	go a.readSerial(subCtx)
-}
-
-func (a *App) readSerial(ctx context.Context) {
-	a.mu.Lock()
-	config := a.serialConfig
-	a.mu.Unlock()
-	port, err := serial.OpenPort(&config)
+	config := &serial.Config{Name: portName, Baud: baudRate}
+	stream, err := serial.OpenPort(config)
 	if err != nil {
-		runtime.LogErrorf(a.ctx, "串口[%s]打开失败: %v", config.Name, err)
-		runtime.EventsEmit(a.ctx, "connection-status", "["+config.Name+"]失败: "+err.Error())
-		return
+		return fmt.Sprintf("连接失败: %v", err)
 	}
-	runtime.LogInfo(a.ctx, "串口["+config.Name+"]打开成功")
-	runtime.EventsEmit(a.ctx, "connection-status", "连接成功")
-	defer func() {
-		port.Close()
-		runtime.LogInfo(a.ctx, "串口已关闭，协程退出")
-	}()
-	reader := bufio.NewReader(port)
-	for {
-		select {
-		case <-ctx.Done(): // 关键：收到取消信号，退出循环
-			return
-		default:
-			line, err := reader.ReadString('\n') // 读取到换行符
-			runtime.LogInfo(a.ctx,line)
-			if err != nil {
-				runtime.LogErrorf(a.ctx, "读取错误: %v", err)
-				continue
-			}
 
-			line = strings.TrimSpace(line)
-			
-			if line == "" {
-				continue
-			}
-			frame, err := parseCSI(line)
-			if err != nil {
-				runtime.LogWarningf(a.ctx, "解析失败: %v | 原始: %s", err, line[:min(len(line), 50)])
-				continue
-			}
-			runtime.LogInfof(a.ctx, "解析成功: RSSI=%d, Index=%d, 子载波=%d个",
-				frame.Rssi, frame.Index, len(frame.Amplitude))
-			runtime.EventsEmit(a.ctx, "csi-data", frame)
-		}
-	}
+	a.portStream = stream
+	go a.readSerialLoop(stream)
+
+	return fmt.Sprintf("成功连接至 %s", portName)
 }
 
-func parseCSI(line string) (*CSIFrame, error) {
-	matches := csiRegex.FindStringSubmatch(line)
-	if matches == nil {
-		return nil, fmt.Errorf("格式不匹配")
-	}
-	rssi, _ := strconv.Atoi(matches[1])
-	index, _ := strconv.Atoi(matches[2])
-	length, _ := strconv.Atoi(matches[3])
-	dataStr := matches[4]
-	raw := []int{}
-	for _, s := range strings.Split(dataStr, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		val, err := strconv.Atoi(s)
-		if err != nil {
-			continue
-		}
-		raw = append(raw, val)
-	}
-	frame := &CSIFrame{
-		Rssi:  rssi,
-		Index: index,
-		Len:   length,
-		Raw:   raw,
-	}
-	// 计算幅度和相位 (实部, 虚部交替)
-	for i := 0; i < len(raw)-1; i += 2 {
-		real := float64(raw[i])
-		imag := float64(raw[i+1])
-
-		amp := math.Sqrt(real*real + imag*imag)
-		phase := math.Atan2(imag, real) * 180 / math.Pi // 转角度
-
-		frame.Amplitude = append(frame.Amplitude, amp)
-		frame.Phase = append(frame.Phase, phase)
-	}
-	return frame, nil
-}
-
-// UpdateSerialConfig 更新串口配置
-// 前端可以传入参数，如：UpdateSerialConfig("COM5", 921600)
-func (a *App) UpdateSerialConfig(name string, baud int) {
+// CloseSerialPort 断开串口
+func (a *App) CloseSerialPort() string {
 	a.mu.Lock()
-	a.serialConfig.Name = name
-	a.serialConfig.Baud = baud
-	a.mu.Unlock()
+	defer a.mu.Unlock()
 
-	runtime.LogInfof(a.ctx, "配置已更新: %s, %d. 正在尝试重连...", name, baud)
+	if a.portStream != nil {
+		a.portStream.Close()
+		a.portStream = nil
+		return "已断开连接"
+	}
+	return "未连接串口"
+}
 
-	// 更新完配置后，通常需要自动重连才能生效
-	a.Reconnect()
+func (a *App) readSerialLoop(stream io.ReadWriteCloser) {
+	// 结束后通知前端已断开
+	defer func() {
+		runtime.EventsEmit(a.ctx, "serial-closed", true)
+	}()
+
+	re := regexp.MustCompile(`data:\[(.*?)\]`)
+	scanner := bufio.NewScanner(stream)
+	buf := make([]byte, 128*1024)
+	scanner.Buffer(buf, 128*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		
+		match := re.FindStringSubmatch(line)
+		if len(match) > 1 {
+			intValues := a.parseInt16Array(match[1])
+			amps, phases := a.calculateCSI(intValues)
+			packet := DataPacket{
+				Data:      intValues,
+				Amplitude: amps,
+				Phase:     phases,
+			}
+			runtime.EventsEmit(a.ctx, "csi-data", packet)
+		}
+	}
+}
+
+func (a *App) calculateCSI(data []int16) ([]float32, []float32) {
+	count := len(data) / 2
+	amps := make([]float32, 0, count)
+	phases := make([]float32, 0, count)
+	for i := 0; i < len(data)-1; i += 2 {
+		imag, real := float64(data[i]), float64(data[i+1])
+		amps = append(amps, float32(math.Sqrt(real*real+imag*imag)))
+		phases = append(phases, float32(math.Atan2(imag, real)))
+	}
+	return amps, phases
+}
+
+func (a *App) parseInt16Array(input string) []int16 {
+	strValues := strings.Split(input, ",")
+	result := make([]int16, 0, len(strValues))
+	for _, s := range strValues {
+		trimmed := strings.TrimSpace(s)
+		if val, err := strconv.ParseInt(trimmed, 10, 16); err == nil {
+			result = append(result, int16(val))
+		}
+	}
+	return result
 }

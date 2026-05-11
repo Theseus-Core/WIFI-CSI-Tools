@@ -1,445 +1,246 @@
+<script setup>
+import { onMounted, onBeforeUnmount, reactive, ref } from 'vue';
+import * as echarts from 'echarts';
+import { EventsOn } from '../wailsjs/runtime/runtime';
+import { OpenSerialPort, CloseSerialPort } from '../wailsjs/go/main/App';
+
+const serialConfig = reactive({
+  port: 'COM3',
+  baud: 115200,
+  isConnected: false,
+  statusMsg: '等待连接'
+});
+
+const settings = reactive({
+  step: 4, // 默认步长改为4（参考你的PyQt代码，降低渲染密度）
+  windowLength: 50, // X轴显示的历史点数
+  fps: 20 // 渲染帧率 (50ms刷新一次)
+});
+
+let ampChart, phaseChart;
+let timestamps = [];
+let ampSeriesMap = new Map();
+let phaseSeriesMap = new Map();
+
+// 【核心优化1】数据缓冲池：接收到的数据先扔到这里，不阻塞接收过程
+let packetBuffer = []; 
+let renderTimer = null;
+
+// 提取公共配置项
+const getCommonOption = (title) => ({
+  title: { 
+    text: title, 
+    textStyle: { color: '#ccc', fontSize: 14 },
+    left: 'center',
+    top: 10
+  },
+  animation: false, // 必须关闭动画，否则高频更新极度卡顿
+  tooltip: { trigger: 'axis' },
+  xAxis: { 
+    type: 'category', 
+    data: [], 
+    axisLine: { lineStyle: { color: '#555' } } 
+  },
+  yAxis: { 
+    type: 'value', 
+    scale: true,
+    splitLine: { lineStyle: { color: '#222' } },
+    axisLine: { lineStyle: { color: '#555' } }
+  },
+  grid: { top: 60, bottom: 40, left: 60, right: 30 }
+});
+
+// 连接操作
+const handleConnect = async () => {
+  serialConfig.statusMsg = "正在尝试连接...";
+  const res = await OpenSerialPort(serialConfig.port, serialConfig.baud);
+  if (res.includes("成功")) {
+    serialConfig.isConnected = true;
+    serialConfig.statusMsg = res;
+  } else {
+    serialConfig.statusMsg = res;
+  }
+};
+
+// 断开操作
+const handleDisconnect = async () => {
+  await CloseSerialPort();
+  serialConfig.isConnected = false;
+  serialConfig.statusMsg = "已断开连接";
+  clearAllData();
+};
+
+const clearAllData = () => {
+  timestamps = [];
+  ampSeriesMap.clear();
+  phaseSeriesMap.clear();
+  packetBuffer = []; // 清空缓冲池
+
+  if (ampChart && phaseChart) {
+    ampChart.clear(); 
+    phaseChart.clear();
+    ampChart.setOption(getCommonOption('CSI 幅度 (Amplitude)'));
+    phaseChart.setOption(getCommonOption('CSI 相位 (Phase)'));
+  }
+};
+
+onMounted(() => {
+  initCharts();
+  
+  // 监听后端数据：不再直接渲染，而是极速塞入缓冲池
+  EventsOn("csi-data", (packet) => {
+    if (!serialConfig.isConnected) return;
+    packetBuffer.push(packet);
+  });
+
+  EventsOn("serial-closed", () => {
+    serialConfig.isConnected = false;
+    serialConfig.statusMsg = "串口已关闭";
+    clearAllData();
+  });
+
+  // 【核心优化2】定时渲染引擎 (参考 PyQt 的 timer.start)
+  // 将计算和渲染彻底从接收事件中剥离
+  renderTimer = setInterval(processBufferAndRender, 1000 / settings.fps);
+});
+
+onBeforeUnmount(() => {
+  if (renderTimer) clearInterval(renderTimer);
+  window.removeEventListener('resize', resizeCharts);
+});
+
+const resizeCharts = () => {
+  if (ampChart) ampChart.resize();
+  if (phaseChart) phaseChart.resize();
+};
+
+const initCharts = () => {
+  const opts = { renderer: 'canvas' };
+  ampChart = echarts.init(document.getElementById('amp-chart'), null, opts);
+  phaseChart = echarts.init(document.getElementById('phase-chart'), null, opts);
+  
+  ampChart.setOption(getCommonOption('CSI 幅度 (Amplitude)'));
+  phaseChart.setOption(getCommonOption('CSI 相位 (Phase)'));
+  
+  window.addEventListener('resize', resizeCharts);
+};
+
+// 【核心优化3】批量处理数据并渲染
+const processBufferAndRender = () => {
+  if (packetBuffer.length === 0 || !serialConfig.isConnected) return;
+
+  // 1. 批量消费缓冲池中的数据
+  const packetsToProcess = [...packetBuffer];
+  packetBuffer = []; // 立即清空，让接收端继续塞数据
+
+  for (const packet of packetsToProcess) {
+    const now = new Date().toLocaleTimeString().split(' ')[0];
+    timestamps.push(now);
+    if (timestamps.length > settings.windowLength) timestamps.shift();
+
+    updateMapData(ampSeriesMap, packet.amplitude);
+    updateMapData(phaseSeriesMap, packet.phase);
+  }
+
+  // 2. 数据处理完毕，执行一次统一渲染
+  refreshCharts();
+};
+
+const updateMapData = (map, data) => {
+  for (let i = 0; i < data.length; i++) {
+    if (!map.has(i)) map.set(i, []);
+    const h = map.get(i);
+    h.push(data[i]);
+    // 限制历史窗口长度
+    if (h.length > settings.windowLength) {
+      // 一次性删掉多余的，防止累积
+      h.splice(0, h.length - settings.windowLength);
+    }
+  }
+};
+
+const refreshCharts = () => {
+  const getSeries = (map) => {
+    const res = [];
+    map.forEach((data, i) => {
+      // 【核心优化4】降采样渲染：只有符合步长的子载波才生成线段 (参考 PyQt 的 DISPLAY_STEP)
+      if (i % settings.step === 0) {
+        res.push({
+          name: `SC${i}`, 
+          type: 'line', 
+          symbol: 'none',
+          sampling: 'lttb', // 开启大据量降采样算法
+          lineStyle: { width: 1.5 },
+          data: data // 直接引用数组，不要用 [...data] 展开，减少内存开销
+        });
+      }
+    });
+    return res;
+  };
+  
+  // setOption 默认合并，传递整个覆盖对象即可
+  ampChart.setOption({ xAxis: { data: timestamps }, series: getSeries(ampSeriesMap) });
+  phaseChart.setOption({ xAxis: { data: timestamps }, series: getSeries(phaseSeriesMap) });
+};
+</script>
+
 <template>
-  <div>
-    <section flex justify-center gap-4 items-end bg-white p-5 text-black shadow-sm border="1 gray-100">
-      <div flex flex-col gap-1>
-        <label text-xs font-bold text-gray-400 uppercase tracking-wider>Serial Port</label>
-        <input
-          v-model="state.name"
-          type="text"
-          placeholder="e.g. COM4"
-          border="1 gray-200"
-          rounded-md
-          px-3
-          py-2
-          w-36
-          focus:ring-2
-          focus:ring-blue-500
-          outline-none
-          transition-all
-        />
-      </div>
-
-      <div flex flex-col gap-1>
-        <label text-xs font-bold text-gray-400 uppercase tracking-wider>Baud Rate</label>
-        <input
-          v-model="state.baud"
-          type="number"
-          placeholder="115200"
-          border="1 gray-200"
-          rounded-md
-          px-3
-          py-2
-          w-36
-          focus:ring-2
-          focus:ring-blue-500
-          outline-none
-          transition-all
-        />
-      </div>
-
-      <button
-        px-5
-        py-2
-        bg-blue-600
-        text-white
-        rounded-md
-        font-medium
-        hover:bg-blue-700
-        active:scale-95
-        transition-all
-        @click="handleUpdate"
-      >
-        应用配置
-      </button>
-
-      <button
-        px-5
-        py-2
-        border="1 blue-600"
-        text-blue-600
-        rounded-md
-        font-medium
-        hover:bg-blue-50
-        active:scale-95
-        transition-all
-        @click="handleReconnect"
-      >
-        重新连接
-      </button>
-
-      <div p-4 rounded-lg border="1 dashed gray-200" flex flex-col justify-center>
-        <span text-xs text-gray-400>连接状态</span>
-        <div flex items-center gap-2 mt-1>
-          <div w-2 h-2 rounded-full :class="state.isConnected ? 'bg-green-500' : 'bg-red-400'"></div>
-          <span font-mono font-bold :class="state.isConnected ? 'text-green-700' : 'text-gray-500'">
-            {{ goLog }}
-          </span>
+  <div class="container">
+    <div class="header">
+      <div class="logo">📡 WiFi-CSI Analyzer</div>
+      <div class="settings-bar">
+        <div class="section">
+          <input v-model="serialConfig.port" :disabled="serialConfig.isConnected" placeholder="端口(COM/tty)"/>
+          <select v-model.number="serialConfig.baud" :disabled="serialConfig.isConnected">
+            <option :value="115200">115200</option>
+            <option :value="921600">921600</option>
+            <option :value="2000000">2000000</option>
+          </select>
+          <button v-if="!serialConfig.isConnected" @click="handleConnect" class="btn-open">打开串口</button>
+          <button v-else @click="handleDisconnect" class="btn-close">断开连接</button>
         </div>
+
+        <div class="divider"></div>
+
+        <div class="section">
+          <label>显示步长(Step):</label>
+          <input type="number" v-model.number="settings.step" :disabled="serialConfig.isConnected" min="1" max="128" title="值越大，显示的线条越少，性能越高" />
+          <label>历史长度:</label>
+          <input type="number" v-model.number="settings.windowLength" :disabled="serialConfig.isConnected" min="10" max="500" />
+        </div>
+
+        <div class="status" :class="{ active: serialConfig.isConnected }">{{ serialConfig.statusMsg }}</div>
       </div>
-    </section>
-    <h2>CSI 数据监控</h2>
-    <div>RSSI: {{ csiData.rssi }}</div>
-    <div>Index: {{ csiData.index }}</div>
-    <div>子载波数量: {{ csiData.amplitude?.length }}</div>
-
-    <!-- 幅度图表 -->
-    <div class="chart-container" wfull flex flex-col gap-2 justify-center items-center>
-      <h3>幅度 (Amplitude)</h3>
-      <canvas ref="amplitudeChart" width="800" height="200"></canvas>
     </div>
 
-    <!-- 相位折线图 -->
-    <div class="chart-container" wfull flex flex-col gap-2 justify-center items-center>
-      <h3>相位 (Phase)</h3>
-      <canvas ref="phaseChart" width="800" height="200"></canvas>
-    </div>
-
-    <!-- 相位差图 -->
-    <div class="chart-container" wfull flex flex-col gap-2 justify-center items-center>
-      <h3>相位差 (Phase Difference) - 与上一帧对比</h3>
-      <canvas ref="phaseDiffChart" width="800" height="200"></canvas>
-    </div>
-
-    <!-- 相位极坐标图 -->
-    <div class="chart-container" wfull flex flex-col gap-2 justify-center items-center>
-      <h3>相位极坐标 (Polar)</h3>
-      <canvas ref="polarChart" width="400" height="400"></canvas>
+    <div class="chart-area">
+      <div v-if="!serialConfig.isConnected" class="empty-overlay">
+        请选择串口并点击“打开串口”开始采集
+      </div>
+      <div id="amp-chart" class="chart"></div>
+      <div id="phase-chart" class="chart"></div>
     </div>
   </div>
 </template>
 
-<script setup>
-import { ref, onMounted, onUnmounted, reactive } from "vue";
-import { EventsOn, EventsOff } from "../wailsjs/runtime";
-import { UpdateSerialConfig, Reconnect } from "../wailsjs/go/main/App";
-
-const csiData = ref({});
-const amplitudeChart = ref(null);
-const phaseChart = ref(null);
-const phaseDiffChart = ref(null);
-const polarChart = ref(null);
-
-// 保存上一帧数据用于计算相位差
-const prevFrame = ref(null);
-const state = reactive({
-  name: "COM4", // 对应 app.go 中的 serialConfig.Name
-  baud: 115200, // 对应 app.go 中的 serialConfig.Baud
-  isConnected: false,
-});
-const goLog = ref("");
-let unsubscribe = null;
-
-const handleUpdate = async () => {
-  // 调用 app.go 中的 UpdateSerialConfig
-  await UpdateSerialConfig(state.name, Number(state.baud));
-};
-
-const handleReconnect = async () => {
-  // 调用 app.go 中的 Reconnect
-  await Reconnect();
-};
-
-onMounted(() => {
-  // 监听连接状态事件
-  EventsOn("connection-status", (status) => {
-    goLog.value = `[${new Date().toLocaleTimeString()}] ${status}\n`;
-    console.log("连接状态:", status);
-    if (status.includes("连接成功")) {
-      state.isConnected = true;
-    } else {
-      state.isConnected = false;
-    }
-  });
-});
-
-onMounted(() => {
-  // 监听 Go 发送的 "csi-data" 事件
-  unsubscribe = EventsOn("csi-data", (frame) => {
-    console.log("收到 CSI:", frame);
-    csiData.value = frame;
-    state.isConnected = true;
-
-    let phaseDiff = null;
-    if (prevFrame.value && prevFrame.value.phase && frame.phase) {
-      phaseDiff = calculatePhaseDiff(prevFrame.value.phase, frame.phase);
-    }
-
-    // 实时绘制幅度图
-    drawAmplitude(frame.amplitude);
-    drawPhase(frame.phase);
-    drawPhaseDiff(phaseDiff);
-    drawPolar(frame.amplitude, frame.phase);
-
-    // 保存当前帧作为上一帧
-    prevFrame.value = {
-      index: frame.index,
-      phase: [...frame.phase],
-      amplitude: [...frame.amplitude],
-    };
-  });
-});
-
-onUnmounted(() => {
-  // 取消监听，防止内存泄漏
-  if (unsubscribe) unsubscribe();
-});
-
-// 计算相位差（处理角度环绕问题）
-function calculatePhaseDiff(prevPhase, currPhase) {
-  const diff = [];
-  const len = Math.min(prevPhase.length, currPhase.length);
-
-  for (let i = 0; i < len; i++) {
-    let delta = currPhase[i] - prevPhase[i];
-
-    // 处理角度环绕：将差值归一化到 [-180, 180] 范围
-    while (delta > 180) delta -= 360;
-    while (delta < -180) delta += 360;
-
-    diff.push(delta);
-  }
-
-  return diff;
-}
-
-function drawAmplitude(amplitude) {
-  const canvas = amplitudeChart.value;
-  if (!canvas || !amplitude) return;
-
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.beginPath();
-  ctx.strokeStyle = "#00ff00";
-
-  const step = w / amplitude.length;
-  const max = 35;
-
-  amplitude.forEach((val, i) => {
-    const x = i * step;
-    const y = h - (val / max) * h * 0.8 - 10;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-
-  ctx.stroke();
-  // 画网格线
-  ctx.strokeStyle = "#333";
-  ctx.lineWidth = 0.5;
-  [0.25, 0.5, 0.75].forEach((ratio) => {
-    ctx.beginPath();
-    ctx.moveTo(0, h - 20 - ratio * (h - 40));
-    ctx.lineTo(w, h - 20 - ratio * (h - 40));
-    ctx.stroke();
-  });
-}
-// 相位折线图
-function drawPhase(phase) {
-  const canvas = phaseChart.value;
-  if (!canvas || !phase) return;
-
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-
-  ctx.fillStyle = "#1a1a2e";
-  ctx.fillRect(0, 0, w, h);
-
-  const step = w / phase.length;
-  const centerY = h / 2;
-
-  // 画0度基准线
-  ctx.strokeStyle = "#444";
-  ctx.lineWidth = 1;
-  ctx.setLineDash([5, 5]);
-  ctx.beginPath();
-  ctx.moveTo(0, centerY);
-  ctx.lineTo(w, centerY);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // 画相位线
-  ctx.beginPath();
-  ctx.strokeStyle = "#ff6600";
-  ctx.lineWidth = 1.5;
-
-  phase.forEach((val, i) => {
-    const x = i * step;
-    // 角度范围 [-180, 180] 映射到画布
-    const y = centerY - (val / 180) * (h / 2 - 20);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-
-  ctx.stroke();
-
-  // 标注
-  ctx.fillStyle = "#888";
-  ctx.font = "12px sans-serif";
-  ctx.fillText("180°", 5, 15);
-  ctx.fillText("0°", 5, centerY + 4);
-  ctx.fillText("-180°", 5, h - 5);
-}
-
-// 相位极坐标图
-function drawPolar(amplitude, phase) {
-  const canvas = polarChart.value;
-  if (!canvas || !phase || !amplitude) return;
-
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-  const cx = w / 2;
-  const cy = h / 2;
-  const maxR = Math.min(w, h) / 2 - 30;
-
-  // 清空
-  ctx.fillStyle = "#1a1a2e";
-  ctx.fillRect(0, 0, w, h);
-
-  // 画同心圆
-  ctx.strokeStyle = "#333";
-  ctx.lineWidth = 1;
-  [0.3, 0.6, 1.0].forEach((ratio) => {
-    ctx.beginPath();
-    ctx.arc(cx, cy, maxR * ratio, 0, Math.PI * 2);
-    ctx.stroke();
-  });
-
-  // 画十字线
-  ctx.beginPath();
-  ctx.moveTo(cx - maxR, cy);
-  ctx.lineTo(cx + maxR, cy);
-  ctx.moveTo(cx, cy - maxR);
-  ctx.lineTo(cx, cy + maxR);
-  ctx.stroke();
-
-  // 画相位点（颜色表示相位，半径表示幅度）
-  const maxAmp = Math.max(...amplitude) || 1;
-
-  phase.forEach((p, i) => {
-    const amp = amplitude[i] || 0;
-    const r = (amp / maxAmp) * maxR;
-    // 角度转弧度，-90度调整让0度在上方
-    const theta = ((p - 90) * Math.PI) / 180;
-
-    const x = cx + r * Math.cos(theta);
-    const y = cy + r * Math.sin(theta);
-
-    // 色相映射：-180°=红，0°=绿，180°=蓝
-    const hue = ((p + 180) / 360) * 240;
-    ctx.fillStyle = `hsl(${hue}, 80%, 60%)`;
-    ctx.beginPath();
-    ctx.arc(x, y, 3, 0, Math.PI * 2);
-    ctx.fill();
-  });
-
-  // 图例
-  ctx.fillStyle = "#fff";
-  ctx.font = "12px sans-serif";
-  ctx.fillText("颜色: 相位 (-180°~180°)", 10, 20);
-  ctx.fillText("半径: 幅度", 10, 35);
-}
-
-// 相位差图
-function drawPhaseDiff(phaseDiff) {
-  const canvas = phaseDiffChart.value;
-  if (!canvas || !phaseDiff) {
-    // 如果没有数据，显示提示
-    if (canvas) {
-      const ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#1a1a2e";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#666";
-      ctx.font = "14px sans-serif";
-      ctx.fillText("等待上一帧数据...", 10, canvas.height / 2);
-    }
-    return;
-  }
-
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-
-  ctx.fillStyle = "#1a1a1e";
-  ctx.fillRect(0, 0, w, h);
-
-  const step = w / phaseDiff.length;
-  const centerY = h / 2;
-
-  // 画0度基准线（无变化线）
-  ctx.strokeStyle = "#444";
-  ctx.lineWidth = 1;
-  ctx.setLineDash([5, 5]);
-  ctx.beginPath();
-  ctx.moveTo(0, centerY);
-  ctx.lineTo(w, centerY);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // 统计最大最小值用于颜色映射
-  const maxDiff = Math.max(...phaseDiff.map(Math.abs));
-  const avgDiff = phaseDiff.reduce((a, b) => a + Math.abs(b), 0) / phaseDiff.length;
-
-  // 画相位差线
-  ctx.beginPath();
-  ctx.lineWidth = 2;
-
-  phaseDiff.forEach((val, i) => {
-    const x = i * step;
-    // 相位差范围 [-180, 180] 映射到画布
-    const y = centerY - (Math.abs(val) / 180) * (h / 2 - 20);
-
-    // 根据差值大小设置颜色：小变化=绿色，大变化=红色
-    const absVal = Math.abs(val);
-    const intensity = Math.min(absVal / 45, 1); // 45度以上为最大强度
-    const r = Math.floor(255 * intensity);
-    const g = Math.floor(255 * (1 - intensity));
-    ctx.strokeStyle = `rgb(${r}, ${g}, 100)`;
-
-    if (i === 0) {
-      ctx.moveTo(x, y);
-    } else {
-      ctx.lineTo(x, y);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-    }
-  });
-
-  // 重绘为连续线条（使用渐变）
-  const gradient = ctx.createLinearGradient(0, 0, w, 0);
-  phaseDiff.forEach((val, i) => {
-    const absVal = Math.abs(val);
-    const intensity = Math.min(absVal / 90, 1);
-    const r = Math.floor(255 * intensity);
-    const g = Math.floor(255 * (1 - intensity * 0.5));
-    const color = `rgb(${r}, ${g}, 50)`;
-    gradient.addColorStop(i / phaseDiff.length, color);
-  });
-
-  ctx.beginPath();
-  ctx.strokeStyle = gradient;
-  ctx.lineWidth = 2;
-  phaseDiff.forEach((val, i) => {
-    const x = i * step;
-    const y = centerY - (val / 180) * (h / 2 - 20);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  // 标注
-  ctx.fillStyle = "#888";
-  ctx.font = "12px sans-serif";
-  ctx.fillText("+180°", 5, 15);
-  ctx.fillText("0° (无变化)", 5, centerY + 4);
-  ctx.fillText("-180°", 5, h - 5);
-
-  // 显示统计信息
-  ctx.fillStyle = "#0f0";
-  ctx.fillText(`最大变化: ${maxDiff.toFixed(1)}° | 平均变化: ${avgDiff.toFixed(1)}°`, w - 200, 15);
-}
-</script>
+<style scoped>
+/* 样式与原版完全保持一致 */
+.container { display: flex; flex-direction: column; height: 100vh; background: #0f0f0f; color: #eee; overflow: hidden; }
+.header { background: #1a1a1a; border-bottom: 1px solid #333; padding: 5px 20px; }
+.logo { font-size: 12px; color: #888; margin-bottom: 5px; }
+.settings-bar { display: flex; align-items: center; gap: 15px; padding-bottom: 5px; }
+.section { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+input, select { background: #262626; border: 1px solid #444; color: #fff; padding: 5px 8px; border-radius: 4px; width: 90px; }
+input:disabled, select:disabled { background: #1a1a1a; color: #666; border-color: #333; cursor: not-allowed; }
+button { padding: 6px 15px; border: none; border-radius: 4px; color: white; cursor: pointer; font-weight: bold; transition: background 0.2s; }
+.btn-open { background: #007acc; }
+.btn-open:hover { background: #0098ff; }
+.btn-close { background: #c62828; }
+.btn-close:hover { background: #ff3d00; }
+.divider { width: 1px; height: 24px; background: #333; }
+.status { margin-left: auto; font-size: 12px; color: #ff9800; background: rgba(255,152,0,0.1); padding: 4px 10px; border-radius: 12px; }
+.status.active { color: #4caf50; background: rgba(76,175,80,0.1); }
+.chart-area { flex: 1; display: flex; flex-direction: column; padding: 15px; gap: 15px; position: relative; }
+.empty-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 10; background: rgba(0,0,0,0.6); padding: 20px 40px; border-radius: 8px; border: 1px dashed #444; color: #666; pointer-events: none; }
+.chart { flex: 1; background: #161616; border-radius: 6px; border: 1px solid #222; min-height: 200px; }
+</style>
