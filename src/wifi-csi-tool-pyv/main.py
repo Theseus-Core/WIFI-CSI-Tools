@@ -43,7 +43,7 @@ current_colors = []
 current_data_len = 0
 
 # 【性能关键】降低渲染密度的步长。设为4意味着每隔4个子载波画一条曲线，有效防止UI卡死。
-DISPLAY_STEP = 4
+DISPLAY_STEP = 16
 
 class csi_data_graphical_window(QWidget):
     def __init__(self):
@@ -181,7 +181,6 @@ def generate_subcarrier_colors(red_range, green_range, yellow_range, total_num):
             colors.append((200, 200, 200))
     return colors
 
-
 def csi_data_read_parse(port: str, csv_writer, log_file_fd):
     global current_colors, current_data_len
 
@@ -199,14 +198,144 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
             
             strings = str(ser.readline())
             raw_line = strings
+            
+            if not strings:
+                break
+            strings = strings.lstrip("b'").rstrip("\\r\\n'")
+            
+            # 【修改】暴力提取 data 部分，找到 [] 闭合的数据
+            #print(strings)
+            
+            # 查找 data: 或者直接查找 [ 和 ]
+            data_start = strings.find('[')
+            data_end = strings.find(']')
+            
+            if data_start == -1 or data_end == -1 or data_end <= data_start:
+                log_file_fd.write(strings + '\n')
+                log_file_fd.flush()
+                print("No valid data array found, skipping...")
+                continue
+            
+            # 提取 data 数组字符串
+            data_str = strings[data_start + 1:data_end]
+            
+            # 使用包序号计数器
+            if not hasattr(csi_data_read_parse, 'pkt_counter'):
+                csi_data_read_parse.pkt_counter = 0
+            pkt_index = csi_data_read_parse.pkt_counter
+            csi_data_read_parse.pkt_counter += 1
+            
+            # 将字符串转换为整数数组
+            csi_raw_data = [int(x.strip()) for x in data_str.split(',') if x.strip()]
+            csi_data_len = len(csi_raw_data) // 2  # I/Q 配对
+
+        except Exception as e:
+            log_file_fd.write('parse error\n' + strings + '\n')
+            continue
+
+        if csi_data_len == 0:
+            log_file_fd.write('csi_data_len is zero\n' + strings + '\n')
+            continue
+
+        # 原有的 fft_gain 和 agc_gain 处理（保持原样）
+        fft_gain = 0.0
+        agc_gain = 0.0
+
+        # 原有的 CSV 写入（保持原样）
+        csv_writer.writerow([pkt_index, csi_data_len, f"[{data_str}]"])
+
+        # ---------------- 核心性能优化区（完全保持原样） ----------------
+        raw_arr = np.array(csi_raw_data, dtype=np.float32)
+        real_parts = raw_arr[1::2] # 奇数索引是实部
+        imag_parts = raw_arr[0::2] # 偶数索引是虚部
+        new_complex_row = real_parts + 1j * imag_parts
+        
+        sub_len = len(new_complex_row)
+
+        new_amp_row = np.abs(new_complex_row)
+        new_phase_row = np.angle(new_complex_row)
+        
+        if count == 0:
+            count = 1
+            raw_len = len(csi_raw_data)
+            print(csi_data_len)
+            if csi_data_len == 106:
+                colors = generate_subcarrier_colors((0,25), (27,53), None, sub_len)
+            elif csi_data_len == 114:
+                colors = generate_subcarrier_colors((0,27), (29,56), None, sub_len)
+            elif csi_data_len == 52:
+                colors = generate_subcarrier_colors((0,12), (13,26), None, sub_len)
+            elif csi_data_len == 234 :
+                colors = generate_subcarrier_colors((0,77), (78,155), (156,233), sub_len)
+            elif csi_data_len == 228 :
+                colors = generate_subcarrier_colors((0,28), (29,57), (57,113), sub_len)
+            elif csi_data_len == 490 :
+                colors = generate_subcarrier_colors((0,61), (62,122), (123,245), sub_len)
+            elif csi_data_len == 128 :
+                colors = generate_subcarrier_colors((0,31), (32,63), None, sub_len)
+            elif csi_data_len == 256 :
+                colors = generate_subcarrier_colors((0,32), (32,63), (64,128), sub_len)
+            elif csi_data_len == 512 :
+                colors = generate_subcarrier_colors((0,63), (64,127), (128,256), sub_len)
+            elif csi_data_len == 384 :
+                colors = generate_subcarrier_colors((0,63), (64,127), (128,192), sub_len)
+            elif 0 < csi_data_len <= 612:
+                colors = generate_subcarrier_colors((0,raw_len//2), (raw_len//2+1,raw_len-1), None, sub_len)
+            else:
+                colors = [(200,200,200)] * sub_len
+            
+            print(len(colors))
+            print(colors)
+            with data_lock:
+                current_colors = colors
+                current_data_len = sub_len
+
+        # 加锁更新全局历史数组（完全保持原样）
+        with data_lock:
+            csi_amplitude_history[:-1] = csi_amplitude_history[1:]
+            csi_amplitude_history[-1, :sub_len] = new_amp_row
+
+            csi_phase_history[:-1] = csi_phase_history[1:]
+            csi_phase_history[-1, :sub_len] = new_phase_row
+
+            csi_complex_latest[:sub_len] = new_complex_row
+            
+            agc_history[:-1] = agc_history[1:]
+            agc_history[-1] = agc_gain
+            
+            fft_history[:-1] = fft_history[1:]
+            fft_history[-1] = fft_gain
+
+    ser.close()
+"""
+def csi_data_read_parse(port: str, csv_writer, log_file_fd):
+    global current_colors, current_data_len
+
+    try:
+        ser = serial.Serial(port=port, baudrate=921600, bytesize=8, parity='N', stopbits=1)
+    except Exception as e:
+        print(f'Open port failed: {e}')
+        return
+    
+    print('Port open success')
+    count = 0
+
+    while True:
+        try:
+            
+            strings = str(ser.readline())
+            raw_line = strings
+            
             if not strings:
                 break
             strings = strings.lstrip("b'").rstrip("\\r\\n'")
             
             # 【修改】寻找新版 C 代码的特征字符 "data:["
+            print(strings)
             if "data:[" not in strings:
                 log_file_fd.write(strings + '\n')
                 log_file_fd.flush()
+                print("not f")
                 continue
 
             # 【修改】解析格式： index:X len:Y data:[Z,Z,Z]
@@ -245,17 +374,7 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
 
         new_amp_row = np.abs(new_complex_row)
         new_phase_row = np.angle(new_complex_row)
-        if new_amp_row.sum() == 0:
-            print("幅值均为0")
-            print(f"raw_line: {raw_line}")
-            continue
-        if 0 in new_amp_row:
-            pass
-            #print("存在幅值为0的子载波")
-            #print(f"raw_line: {raw_line}")
-            #print(f"幅值为0的子载波索引: {np.where(new_amp_row == 0)[0]}")
-            #continue
-        # 颜色初始化逻辑
+        
         if count == 0:
             count = 1
             raw_len = len(csi_raw_data)
@@ -305,7 +424,7 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
             fft_history[-1] = fft_gain
 
     ser.close()
-
+"""
 
 class SubThread(QThread):
     def __init__(self, serial_port, save_file_name, log_file_name):
