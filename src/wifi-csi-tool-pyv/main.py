@@ -43,7 +43,7 @@ current_colors = []
 current_data_len = 0
 
 # 【性能关键】降低渲染密度的步长。设为4意味着每隔4个子载波画一条曲线，有效防止UI卡死。
-DISPLAY_STEP = 16
+DISPLAY_STEP = 4
 
 class csi_data_graphical_window(QWidget):
     def __init__(self):
@@ -263,6 +263,8 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
                 colors = generate_subcarrier_colors((0,25), (27,53), None, sub_len)
             elif csi_data_len == 114:
                 colors = generate_subcarrier_colors((0,27), (29,56), None, sub_len)
+            elif csi_data_len == 117:
+                colors = generate_subcarrier_colors((0,38), (39,78), (79,116), sub_len)
             elif csi_data_len == 52:
                 colors = generate_subcarrier_colors((0,12), (13,26), None, sub_len)
             elif csi_data_len == 234 :
