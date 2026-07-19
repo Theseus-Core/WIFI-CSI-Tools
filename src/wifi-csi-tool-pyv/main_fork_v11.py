@@ -401,9 +401,16 @@ sw_emj_list = ["🤔","😀","🤓"]
 sw_emj_list_idx = 0
 sleep_flag = 0
 
-
 timer = float(0)
 dataset = []
+
+# 状态机全局变量
+recording_state = False
+above_threshold_count = 0
+below_threshold_count = 0
+session_cache = []
+history_buffer = deque(maxlen=3)
+
 @on_csi_event('on_csi_data', priority=10)
 def print_stats(data):
     global init_max_std
@@ -413,6 +420,11 @@ def print_stats(data):
     global g_ui_window
     global timer
     global dataset
+    global recording_state
+    global above_threshold_count
+    global below_threshold_count
+    global session_cache
+    global history_buffer
     
     data_len = data['data_len']
     amplitude = data['amplitude']  # shape: (data_len,)
@@ -495,25 +507,68 @@ def print_stats(data):
     max_range_val = np.max(range_vals)      # 最大极差
     avg_range_val = np.mean(range_vals)     # 平均极差
     
-    if avg_std_val > 6:
-        dataset.append(np.array(window_data))
-        timer += 1
+    # 将当前帧数据和强度放入历史缓冲区
+    history_buffer.append((np.array(window_data), avg_std_val))
     
+    threshold = 3
+    
+    if avg_std_val > threshold:
+        above_threshold_count += 1
+        below_threshold_count = 0
+    else:
+        above_threshold_count = 0
+        below_threshold_count += 1
+        
+    if not recording_state:
+        if above_threshold_count >= 3:
+            recording_state = True
+            # 初始化 session_cache，包含历史缓冲区内的3帧
+            session_cache = list(history_buffer)
+            print(f"[State Machine] Transition to RECORDING state. Initialized with {len(session_cache)} historical frames.")
+    else:
+        # 在录制状态中，持续收集数据
+        session_cache.append((np.array(window_data), avg_std_val))
+        
+        if below_threshold_count >= 5:
+            # 退出录制状态
+            recording_state = False
+            if session_cache:
+                N = len(session_cache)
+                num_to_keep = max(1, int(np.ceil(0.30 * N)))
+                
+                # 按照强度（avg_std_val）降序排序
+                sorted_cache = sorted(session_cache, key=lambda x: x[1], reverse=True)
+                
+                # 保留强度最高的前25%
+                kept_samples = sorted_cache[:num_to_keep]
+                for sample, val in kept_samples:
+                    dataset.append(sample)
+                    
+                timer += 1  # 动作计数增加
+                print(f"[State Machine] Transition to CALM state. Session finished. Total frames: {N}, Kept top 25%: {num_to_keep}, Total dataset samples: {len(dataset)}")
+            
+            session_cache = []
+            above_threshold_count = 0
+            below_threshold_count = 0
 
     # 更新UI显示统计数据（线程安全）
     if g_ui_window:
-        # 更新最小标准差
+        # 更新平均标准差
         QMetaObject.invokeMethod(g_ui_window, "update_stat_value",
                                  Qt.QueuedConnection,
                                  Q_ARG(str, "avg_std"),
-                                 Q_ARG(float, avg_std_val))  # 这里显示平均标准差作为示例
-        # 更新最大标准差
-        QMetaObject.invokeMethod(g_ui_window, "update_stat_value",
+                                 Q_ARG(float, avg_std_val))
+        
+        # 使用 update_stat_value_str 更新录制状态和数据集大小
+        if recording_state:
+            status_str = f"🔴 Rec ({len(session_cache)}f) | Total: {len(dataset)}"
+        else:
+            status_str = f"🟢 Calm | Total: {len(dataset)}"
+            
+        QMetaObject.invokeMethod(g_ui_window, "update_stat_value_str",
                                  Qt.QueuedConnection,
                                  Q_ARG(str, "is_wave"),
-                                 Q_ARG(float, timer))
-
-
+                                 Q_ARG(str, status_str))
 
 @on_csi_event('on_error')
 def handle_error(error_data):
@@ -724,10 +779,7 @@ class CSIDataGraphicalWindow(QWidget):
             if self.stats_panel.x() > self.width() / 2:
                 self.stats_panel.move(self.width() - self.stats_panel.width() - 10, self.stats_panel.y())
         super().resizeEvent(event)
-
-    
         
-    
     @pyqtSlot(str, float)
     def update_stat_value(self, stat_name, value):
         """更新浮点数类型的统计值（可从其他线程调用）"""
@@ -799,8 +851,19 @@ class CSIDataGraphicalWindow(QWidget):
 
     def closeEvent(self, event):
         """窗口关闭时的处理"""
-        global dataset
+        global dataset, recording_state, session_cache
         
+        # 如果当前仍在录制状态，强制结算剩余缓存数据
+        if recording_state and session_cache:
+            N = len(session_cache)
+            num_to_keep = max(1, int(np.ceil(0.25 * N)))
+            sorted_cache = sorted(session_cache, key=lambda x: x[1], reverse=True)
+            for sample, val in sorted_cache[:num_to_keep]:
+                dataset.append(sample)
+            print(f"[Close Event] Flushing remaining recording session: {N} frames -> kept top 25% ({num_to_keep} frames).")
+            session_cache = []
+            recording_state = False
+            
         # 保存 dataset 到 npz 文件
         if dataset:
             save_path = f'data/{self.dataset_tag}_{time.strftime("%Y%m%d_%H%M%S")}.npz'
@@ -814,7 +877,6 @@ class CSIDataGraphicalWindow(QWidget):
         
         # 接受关闭事件
         event.accept()
-
 
 
 if __name__ == '__main__':
