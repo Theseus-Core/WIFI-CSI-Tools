@@ -1,0 +1,1 @@
+Error in read loop: byref() argument must be a ctypes instance, not 'NoneType'

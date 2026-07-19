@@ -13,10 +13,11 @@ class CSITester:
             print(f"[!] 无法打开串口: {e}")
             sys.exit(1)
 
-    def generate_csi_data(self, length=224, min_val=0, max_val=50):
+    def generate_csi_data(self, length=228, min_val=0, max_val=50):
         """生成模拟的 CSI 数组字符串"""
-        data_array = [random.randint(min_val, max_val) for _ in range(length)]
-        return f"type:CSI,rssi:-65,data:{data_array}\n"
+        data_array = [random.randint(min_val, max_val) for i in range(length)]
+        #data_array = [10 for _ in range(length)]
+        return f"index:1 rssi:9 data:{data_array}\n"
 
     def test_case_fixed(self):
         """用例1：发送固定格式数据"""
@@ -48,7 +49,7 @@ class CSITester:
         try:
             count = 0
             while True:
-                payload = self.generate_csi_data(length=224)
+                payload = self.generate_csi_data(length=468)
                 self.ser.write(payload.encode('utf-8'))
                 count += 1
                 if count % 10 == 0:

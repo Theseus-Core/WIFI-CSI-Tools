@@ -8,32 +8,26 @@ import sys
 import csv
 import json
 import argparse
-import pandas as pd
 import numpy as np
 import serial
 from os import path
 from io import StringIO
+import time
 
 from PyQt5.Qt import *
 from pyqtgraph import PlotWidget
 from PyQt5 import QtCore
 import pyqtgraph as pg
 from pyqtgraph import ScatterPlotItem
-from PyQt5.QtCore import pyqtSignal, QThread
+from PyQt5.QtCore import QThread
 import threading
-import time
-from scipy.optimize import minimize
-import matplotlib.pyplot as plt
-from scipy.stats import linregress
-import statsmodels.api as sm
 
 # ----------------- 全局常量与变量 -----------------
 CSI_DATA_INDEX = 200  # 历史缓冲区大小
 CSI_DATA_COLUMNS = 490  # 最大子载波数量
 
-DATA_COLUMNS_NAMES_C5C6 = ['type', 'id', 'mac', 'rssi', 'rate','noise_floor','fft_gain','agc_gain', 'channel', 'local_timestamp',  'sig_len', 'rx_state', 'len', 'first_word', 'data']
-DATA_COLUMNS_NAMES = ['type', 'id', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth', 'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
-                      'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel', 'local_timestamp', 'ant', 'sig_len', 'rx_state', 'len', 'first_word', 'data']
+# 【修改】适配新版发送端的数据表头
+DATA_COLUMNS_NAMES = ['index', 'len', 'data']
 
 # 使用线程锁保护共享数据
 data_lock = threading.Lock()
@@ -50,8 +44,12 @@ current_colors = []
 current_data_len = 0
 
 # 【性能关键】降低渲染密度的步长。设为4意味着每隔4个子载波画一条曲线，有效防止UI卡死。
-# 如果你的电脑性能极强，可以尝试改回 1。
-DISPLAY_STEP = 100
+DISPLAY_STEP = 4
+
+# 【新增】帧平均幅度监测相关变量 - 消抖控制
+last_off_time = 0  # 上次输出off的时间戳
+DEBOUNCE_TIME = 0.5  # 消抖时间（秒），0.5秒内不重复输出
+AMPLITUDE_THRESHOLD = 20  # 幅度阈值
 
 class csi_data_graphical_window(QWidget):
     def __init__(self):
@@ -77,14 +75,13 @@ class csi_data_graphical_window(QWidget):
         self.plotWidget_multi_data.setLabel('left', 'Amplitude')
         self.plotWidget_multi_data.setLabel('bottom', 'Time (Cumulative Packet Count)')
 
-        # 独立分离出 AGC 和 FFT 曲线（修复了原版列表索引越界Bug）
+        # 独立分离出 AGC 和 FFT 曲线
         self.agc_curve = self.plotWidget_multi_data.plot([], name='AGC Gain', pen=(255,255,0))
         self.fft_curve = self.plotWidget_multi_data.plot([], name='FFT Gain', pen=(255,0,255))
         
         self.amp_curves = []
         for i in range(CSI_DATA_COLUMNS):
             curve = self.plotWidget_multi_data.plot([], pen=(200, 200, 200))
-            # 默认隐藏，稍后在有数据时按需显示
             curve.setVisible(False)
             self.amp_curves.append(curve)
 
@@ -123,10 +120,10 @@ class csi_data_graphical_window(QWidget):
         # 定时器刷新 UI
         self.timer = pg.QtCore.QTimer()
         self.timer.timeout.connect(self.update_data)
-        self.timer.start(50) # 100ms (10帧/秒) 已经足够人眼观测
+        self.timer.start(50) # 50ms (20帧/秒)
 
     def update_data(self):
-        # 1. 快速获取数据快照并释放锁，避免阻塞串口接收线程
+        # 1. 快速获取数据快照并释放锁
         with data_lock:
             data_len = current_data_len
             if data_len == 0:
@@ -142,7 +139,6 @@ class csi_data_graphical_window(QWidget):
         if data_len != self.last_data_len or colors_snapshot != self.cached_colors:
             self.plotWidget_ted.setXRange(0, data_len)
             
-            # 缓存散点图的画刷（避免每次循环生成）
             self.cached_brushes = [pg.mkBrush(c) for c in colors_snapshot]
             self.cached_colors = colors_snapshot
             self.last_data_len = data_len
@@ -161,7 +157,7 @@ class csi_data_graphical_window(QWidget):
         # 3. 更新最后一帧相位
         self.curve.setData(np.angle(complex_latest))
 
-        # 4. 更新历史曲线（仅更新设置了可见性的部分）
+        # 4. 更新历史曲线
         self.agc_curve.setData(agc_hist)
         self.fft_curve.setData(fft_hist)
 
@@ -169,7 +165,7 @@ class csi_data_graphical_window(QWidget):
             self.amp_curves[i].setData(amp_history[:, i])
             self.phase_curves[i].setData(phase_history[:, i])
 
-        # 5. 更新 IQ 散点图（向量化调用，取消慢速字典构建）
+        # 5. 更新 IQ 散点图
         real_parts = np.real(complex_latest)
         imag_parts = np.imag(complex_latest)
         self.iq_scatter.setData(x=real_parts, y=imag_parts, brush=self.cached_brushes)
@@ -191,6 +187,28 @@ def generate_subcarrier_colors(red_range, green_range, yellow_range, total_num):
             colors.append((200, 200, 200))
     return colors
 
+def check_frame_average_amplitude(amplitude_row, pkt_index):
+    """检查单帧的平均幅度，如果小于阈值且消抖时间已过，输出OFF"""
+    global last_off_time
+    
+    # 计算当前帧所有子载波的平均幅度
+    avg_amplitude = np.mean(amplitude_row)
+    
+    # 获取当前时间
+    current_time = time.time()
+    
+    # 如果平均幅度小于阈值，且距离上次输出超过消抖时间
+    if avg_amplitude < AMPLITUDE_THRESHOLD:
+        if current_time - last_off_time >= DEBOUNCE_TIME:
+            print(f"[OFF DETECTED] Frame {pkt_index} - Average Amplitude: {avg_amplitude:.2f} (threshold: {AMPLITUDE_THRESHOLD})")
+            last_off_time = current_time
+            return True  # 表示检测到OFF
+    else:
+        # 可选：输出恢复正常信息（避免刷屏，只在阈值附近输出）
+        if avg_amplitude < AMPLITUDE_THRESHOLD + 10:  # 在阈值附近时输出
+            print(f"[Normal] Frame {pkt_index} - Average Amplitude: {avg_amplitude:.2f}")
+    
+    return False
 
 def csi_data_read_parse(port: str, csv_writer, log_file_fd):
     global current_colors, current_data_len
@@ -205,44 +223,54 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
     count = 0
 
     while True:
-        strings = str(ser.readline())
-        if not strings:
-            break
-        strings = strings.lstrip("b'").rstrip("\\r\\n'")
-        index = strings.find('CSI_DATA')
-
-        if index == -1:
-            log_file_fd.write(strings + '\n')
-            log_file_fd.flush()
-            continue
-
-        csv_reader = csv.reader(StringIO(strings))
         try:
-            csi_data = next(csv_reader)
-        except StopIteration:
-            continue
             
-        csi_data_len = int(csi_data[-3])
-        if len(csi_data) != len(DATA_COLUMNS_NAMES) and len(csi_data) != len(DATA_COLUMNS_NAMES_C5C6):
-            log_file_fd.write('element number is not equal\n' + strings + '\n')
+            strings = str(ser.readline())
+            raw_line = strings
+            
+            if not strings:
+                break
+            strings = strings.lstrip("b'").rstrip("\\r\\n'")
+            
+            # 查找 data 数组的起止位置
+            data_start = strings.find('[')
+            data_end = strings.find(']')
+            
+            if data_start == -1 or data_end == -1 or data_end <= data_start:
+                log_file_fd.write(strings + '\n')
+                log_file_fd.flush()
+                print("No valid data array found, skipping...")
+                continue
+            
+            # 提取 data 数组字符串
+            data_str = strings[data_start + 1:data_end]
+            
+            # 使用包序号计数器
+            if not hasattr(csi_data_read_parse, 'pkt_counter'):
+                csi_data_read_parse.pkt_counter = 0
+            pkt_index = csi_data_read_parse.pkt_counter
+            csi_data_read_parse.pkt_counter += 1
+            
+            # 将字符串转换为整数数组
+            csi_raw_data = [int(x.strip()) for x in data_str.split(',') if x.strip()]
+            csi_data_len = len(csi_raw_data) // 2  # I/Q 配对
+
+        except Exception as e:
+            log_file_fd.write('parse error\n' + strings + '\n')
             continue
 
-        try:
-            csi_raw_data = json.loads(csi_data[-1])
-        except json.JSONDecodeError:
-            log_file_fd.write('data is incomplete\n' + strings + '\n')
+        if csi_data_len == 0:
+            log_file_fd.write('csi_data_len is zero\n' + strings + '\n')
             continue
 
-        if csi_data_len != len(csi_raw_data):
-            log_file_fd.write('csi_data_len is not equal\n' + strings + '\n')
-            continue
+        # 原有的 fft_gain 和 agc_gain 处理（保持原样）
+        fft_gain = 0.0
+        agc_gain = 0.0
 
-        fft_gain = float(csi_data[6])
-        agc_gain = float(csi_data[7])
-        csv_writer.writerow(csi_data)
+        # 原有的 CSV 写入（保持原样）
+        csv_writer.writerow([pkt_index, csi_data_len, f"[{data_str}]"])
 
         # ---------------- 核心性能优化区 ----------------
-        # 1. 向量化构建复数 (直接砍掉原来的纯Python for循环)
         raw_arr = np.array(csi_raw_data, dtype=np.float32)
         real_parts = raw_arr[1::2] # 奇数索引是实部
         imag_parts = raw_arr[0::2] # 偶数索引是虚部
@@ -250,22 +278,26 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
         
         sub_len = len(new_complex_row)
 
-        # 2. 将耗时的数学运算放在子线程，并只计算最新一帧
         new_amp_row = np.abs(new_complex_row)
         new_phase_row = np.angle(new_complex_row)
-
-        # 3. 颜色初始化逻辑
+        
+        # 【新增】实时检测当前帧的平均幅度，带消抖控制
+        check_frame_average_amplitude(new_amp_row, pkt_index)
+        
         if count == 0:
             count = 1
             raw_len = len(csi_raw_data)
+            print(f"CSI Data Length: {csi_data_len}")
             if csi_data_len == 106:
                 colors = generate_subcarrier_colors((0,25), (27,53), None, sub_len)
             elif csi_data_len == 114:
                 colors = generate_subcarrier_colors((0,27), (29,56), None, sub_len)
+            elif csi_data_len == 117:
+                colors = generate_subcarrier_colors((0,38), (39,78), (79,116), sub_len)
             elif csi_data_len == 52:
                 colors = generate_subcarrier_colors((0,12), (13,26), None, sub_len)
             elif csi_data_len == 234 :
-                colors = generate_subcarrier_colors((0,28), (29,56), (60,116), sub_len)
+                colors = generate_subcarrier_colors((0,77), (78,155), (156,233), sub_len)
             elif csi_data_len == 228 :
                 colors = generate_subcarrier_colors((0,28), (29,57), (57,113), sub_len)
             elif csi_data_len == 490 :
@@ -283,11 +315,12 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
             else:
                 colors = [(200,200,200)] * sub_len
             
+            print(f"Number of colors: {len(colors)}")
             with data_lock:
                 current_colors = colors
                 current_data_len = sub_len
 
-        # 4. 加锁更新全局历史数组
+        # 加锁更新全局历史数组
         with data_lock:
             csi_amplitude_history[:-1] = csi_amplitude_history[1:]
             csi_amplitude_history[-1, :sub_len] = new_amp_row
@@ -305,7 +338,6 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
 
     ser.close()
 
-
 class SubThread(QThread):
     def __init__(self, serial_port, save_file_name, log_file_name):
         super().__init__()
@@ -313,6 +345,7 @@ class SubThread(QThread):
         save_file_fd = open(save_file_name, 'w', newline='')
         self.log_file_fd = open(log_file_name, 'w')
         self.csv_writer = csv.writer(save_file_fd)
+        # 使用新的表头写入 CSV
         self.csv_writer.writerow(DATA_COLUMNS_NAMES)
 
     def run(self):

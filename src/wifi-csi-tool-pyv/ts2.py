@@ -8,32 +8,23 @@ import sys
 import csv
 import json
 import argparse
-import pandas as pd
 import numpy as np
 import serial
 from os import path
 from io import StringIO
+import re
 
 from PyQt5.Qt import *
 from pyqtgraph import PlotWidget
 from PyQt5 import QtCore
 import pyqtgraph as pg
 from pyqtgraph import ScatterPlotItem
-from PyQt5.QtCore import pyqtSignal, QThread
+from PyQt5.QtCore import QThread
 import threading
-import time
-from scipy.optimize import minimize
-import matplotlib.pyplot as plt
-from scipy.stats import linregress
-import statsmodels.api as sm
 
 # ----------------- 全局常量与变量 -----------------
 CSI_DATA_INDEX = 200  # 历史缓冲区大小
 CSI_DATA_COLUMNS = 490  # 最大子载波数量
-
-DATA_COLUMNS_NAMES_C5C6 = ['type', 'id', 'mac', 'rssi', 'rate','noise_floor','fft_gain','agc_gain', 'channel', 'local_timestamp',  'sig_len', 'rx_state', 'len', 'first_word', 'data']
-DATA_COLUMNS_NAMES = ['type', 'id', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth', 'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
-                      'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel', 'local_timestamp', 'ant', 'sig_len', 'rx_state', 'len', 'first_word', 'data']
 
 # 使用线程锁保护共享数据
 data_lock = threading.Lock()
@@ -49,9 +40,8 @@ fft_history = np.zeros(CSI_DATA_INDEX, dtype=np.float32)
 current_colors = []
 current_data_len = 0
 
-# 【性能关键】降低渲染密度的步长。设为4意味着每隔4个子载波画一条曲线，有效防止UI卡死。
-# 如果你的电脑性能极强，可以尝试改回 1。
-DISPLAY_STEP = 100
+# 【性能关键】降低渲染密度的步长
+DISPLAY_STEP = 20
 
 class csi_data_graphical_window(QWidget):
     def __init__(self):
@@ -77,14 +67,13 @@ class csi_data_graphical_window(QWidget):
         self.plotWidget_multi_data.setLabel('left', 'Amplitude')
         self.plotWidget_multi_data.setLabel('bottom', 'Time (Cumulative Packet Count)')
 
-        # 独立分离出 AGC 和 FFT 曲线（修复了原版列表索引越界Bug）
+        # 独立分离出 AGC 和 FFT 曲线
         self.agc_curve = self.plotWidget_multi_data.plot([], name='AGC Gain', pen=(255,255,0))
         self.fft_curve = self.plotWidget_multi_data.plot([], name='FFT Gain', pen=(255,0,255))
         
         self.amp_curves = []
         for i in range(CSI_DATA_COLUMNS):
             curve = self.plotWidget_multi_data.plot([], pen=(200, 200, 200))
-            # 默认隐藏，稍后在有数据时按需显示
             curve.setVisible(False)
             self.amp_curves.append(curve)
 
@@ -123,10 +112,10 @@ class csi_data_graphical_window(QWidget):
         # 定时器刷新 UI
         self.timer = pg.QtCore.QTimer()
         self.timer.timeout.connect(self.update_data)
-        self.timer.start(50) # 100ms (10帧/秒) 已经足够人眼观测
+        self.timer.start(50)
 
     def update_data(self):
-        # 1. 快速获取数据快照并释放锁，避免阻塞串口接收线程
+        # 1. 快速获取数据快照并释放锁
         with data_lock:
             data_len = current_data_len
             if data_len == 0:
@@ -142,7 +131,6 @@ class csi_data_graphical_window(QWidget):
         if data_len != self.last_data_len or colors_snapshot != self.cached_colors:
             self.plotWidget_ted.setXRange(0, data_len)
             
-            # 缓存散点图的画刷（避免每次循环生成）
             self.cached_brushes = [pg.mkBrush(c) for c in colors_snapshot]
             self.cached_colors = colors_snapshot
             self.last_data_len = data_len
@@ -161,7 +149,7 @@ class csi_data_graphical_window(QWidget):
         # 3. 更新最后一帧相位
         self.curve.setData(np.angle(complex_latest))
 
-        # 4. 更新历史曲线（仅更新设置了可见性的部分）
+        # 4. 更新历史曲线
         self.agc_curve.setData(agc_hist)
         self.fft_curve.setData(fft_hist)
 
@@ -169,7 +157,7 @@ class csi_data_graphical_window(QWidget):
             self.amp_curves[i].setData(amp_history[:, i])
             self.phase_curves[i].setData(phase_history[:, i])
 
-        # 5. 更新 IQ 散点图（向量化调用，取消慢速字典构建）
+        # 5. 更新 IQ 散点图
         real_parts = np.real(complex_latest)
         imag_parts = np.imag(complex_latest)
         self.iq_scatter.setData(x=real_parts, y=imag_parts, brush=self.cached_brushes)
@@ -205,103 +193,167 @@ def csi_data_read_parse(port: str, csv_writer, log_file_fd):
     count = 0
 
     while True:
-        strings = str(ser.readline())
-        if not strings:
-            break
-        strings = strings.lstrip("b'").rstrip("\\r\\n'")
-        index = strings.find('CSI_DATA')
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+            
+            # 查找 data: 标记
+            data_marker = 'data:'
+            marker_index = line.find(data_marker)
+            
+            if marker_index == -1:
+                log_file_fd.write(line + '\n')
+                log_file_fd.flush()
+                continue
+            
+            # 提取 data: 后面的数组内容
+            data_content = line[marker_index + len(data_marker):].strip()
+            
+            # 解析数组（格式为 [-8,-3,-8,...]）
+            if not data_content.startswith('['):
+                log_file_fd.write(f'Data content does not start with [: {data_content}\n')
+                continue
+            
+            # 找到匹配的结束括号
+            bracket_count = 0
+            end_index = -1
+            for i, char in enumerate(data_content):
+                if char == '[':
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        end_index = i
+                        break
+            
+            if end_index == -1:
+                log_file_fd.write(f'Incomplete data array: {data_content}\n')
+                continue
+            
+            # 提取数组字符串
+            array_str = data_content[:end_index + 1]
+            
+            # 解析 JSON 数组
+            try:
+                csi_raw_data = json.loads(array_str)
+            except json.JSONDecodeError as e:
+                log_file_fd.write(f'Failed to parse JSON array: {array_str}, error: {e}\n')
+                continue
+            
+            if not isinstance(csi_raw_data, list) or len(csi_raw_data) == 0:
+                log_file_fd.write(f'Invalid data array: {array_str}\n')
+                continue
+            
+            # 数据长度应该是偶数（I/Q 对）
+            if len(csi_raw_data) % 2 != 0:
+                log_file_fd.write(f'Odd number of data points: {len(csi_raw_data)}\n')
+                continue
+            
+            # 提取 index 和 len
+            index_match = re.search(r'index:(\d+)', line)
+            len_match = re.search(r'len:(\d+)', line)
+            
+            pkt_index = int(index_match.group(1)) if index_match else 0
+            csi_data_len = int(len_match.group(1)) if len_match else len(csi_raw_data)
+            
+            # 提取 compensate_gain（如果存在）
+            compensate_match = re.search(r'compensate_gain\s+%f\s+([\d\.]+)', line)
+            compensate_gain = float(compensate_match.group(1)) if compensate_match else 1.0
+            
+            # 提取 agc_gain 和 fft_gain（如果存在）
+            agc_match = re.search(r'agc_gain[:\s=]+(\d+)', line, re.IGNORECASE)
+            fft_match = re.search(r'fft_gain[:\s=]+(\d+)', line, re.IGNORECASE)
+            
+            agc_gain = float(agc_match.group(1)) if agc_match else 0.0
+            fft_gain = float(fft_match.group(1)) if fft_match else 0.0
+            
+            # 验证数据长度
+            if csi_data_len != len(csi_raw_data):
+                log_file_fd.write(f'data_len mismatch: expected {csi_data_len}, got {len(csi_raw_data)}\n')
+                # 使用实际长度继续处理
+                csi_data_len = len(csi_raw_data)
+            
+            # 写入 CSV 文件
+            csv_writer.writerow([pkt_index, csi_data_len, array_str])
 
-        if index == -1:
-            log_file_fd.write(strings + '\n')
+            # ---------------- 核心性能优化区 ----------------
+            # 向量化构建复数（正确方式：偶数索引是实部 I，奇数索引是虚部 Q）
+            raw_arr = np.array(csi_raw_data, dtype=np.float32)
+            real_parts = raw_arr[0::2]  # 偶数索引是实部
+            imag_parts = raw_arr[1::2]  # 奇数索引是虚部
+            new_complex_row = real_parts + 1j * imag_parts
+            
+            sub_len = len(new_complex_row)
+
+            new_amp_row = np.abs(new_complex_row)
+            new_phase_row = np.angle(new_complex_row)
+            
+            # 打印调试信息（前10帧）
+            if count < 10:
+                print(f"Frame {count}: index={pkt_index}, len={csi_data_len}, subcarriers={sub_len}, compensate_gain={compensate_gain}")
+                print(f"  First 5 I/Q pairs: I={real_parts[:5]}, Q={imag_parts[:5]}")
+                print(f"  First 5 amplitudes: {new_amp_row[:5]}")
+                print(f"  First 5 phases: {new_phase_row[:5]}")
+            
+            if count == 0:
+                # 根据数据长度生成对应的子载波颜色
+                if csi_data_len == 106:
+                    colors = generate_subcarrier_colors((0,25), (27,53), None, sub_len)
+                elif csi_data_len == 114:
+                    colors = generate_subcarrier_colors((0,27), (29,56), None, sub_len)
+                elif csi_data_len == 52:
+                    colors = generate_subcarrier_colors((0,12), (13,26), None, sub_len)
+                elif csi_data_len == 234:
+                    colors = generate_subcarrier_colors((0,28), (29,56), (60,116), sub_len)
+                elif csi_data_len == 228:
+                    colors = generate_subcarrier_colors((0,28), (29,57), (57,113), sub_len)
+                elif csi_data_len == 490:
+                    colors = generate_subcarrier_colors((0,61), (62,122), (123,245), sub_len)
+                elif csi_data_len == 128:
+                    colors = generate_subcarrier_colors((0,31), (32,63), None, sub_len)
+                elif csi_data_len == 256:
+                    colors = generate_subcarrier_colors((0,32), (32,63), (64,128), sub_len)
+                elif csi_data_len == 512:
+                    colors = generate_subcarrier_colors((0,63), (64,127), (128,256), sub_len)
+                elif csi_data_len == 384:
+                    colors = generate_subcarrier_colors((0,63), (64,127), (128,192), sub_len)
+                else:
+                    # 对于 234 的情况
+                    if csi_data_len == 234:
+                        colors = generate_subcarrier_colors((0,28), (29,56), (60,116), sub_len)
+                    else:
+                        colors = [(200,200,200)] * sub_len
+                
+                with data_lock:
+                    current_colors = colors
+                    current_data_len = sub_len
+            
+            count += 1
+
+            # 加锁更新全局历史数组
+            with data_lock:
+                # 滚动更新历史数据
+                csi_amplitude_history[:-1] = csi_amplitude_history[1:]
+                csi_amplitude_history[-1, :sub_len] = new_amp_row
+
+                csi_phase_history[:-1] = csi_phase_history[1:]
+                csi_phase_history[-1, :sub_len] = new_phase_row
+
+                csi_complex_latest[:sub_len] = new_complex_row
+                
+                agc_history[:-1] = agc_history[1:]
+                agc_history[-1] = agc_gain
+                
+                fft_history[:-1] = fft_history[1:]
+                fft_history[-1] = fft_gain
+
+        except Exception as e:
+            log_file_fd.write(f'parse error: {e}\n')
+            import traceback
+            log_file_fd.write(traceback.format_exc())
             log_file_fd.flush()
             continue
-
-        csv_reader = csv.reader(StringIO(strings))
-        try:
-            csi_data = next(csv_reader)
-        except StopIteration:
-            continue
-            
-        csi_data_len = int(csi_data[-3])
-        if len(csi_data) != len(DATA_COLUMNS_NAMES) and len(csi_data) != len(DATA_COLUMNS_NAMES_C5C6):
-            log_file_fd.write('element number is not equal\n' + strings + '\n')
-            continue
-
-        try:
-            csi_raw_data = json.loads(csi_data[-1])
-        except json.JSONDecodeError:
-            log_file_fd.write('data is incomplete\n' + strings + '\n')
-            continue
-
-        if csi_data_len != len(csi_raw_data):
-            log_file_fd.write('csi_data_len is not equal\n' + strings + '\n')
-            continue
-
-        fft_gain = float(csi_data[6])
-        agc_gain = float(csi_data[7])
-        csv_writer.writerow(csi_data)
-
-        # ---------------- 核心性能优化区 ----------------
-        # 1. 向量化构建复数 (直接砍掉原来的纯Python for循环)
-        raw_arr = np.array(csi_raw_data, dtype=np.float32)
-        real_parts = raw_arr[1::2] # 奇数索引是实部
-        imag_parts = raw_arr[0::2] # 偶数索引是虚部
-        new_complex_row = real_parts + 1j * imag_parts
-        
-        sub_len = len(new_complex_row)
-
-        # 2. 将耗时的数学运算放在子线程，并只计算最新一帧
-        new_amp_row = np.abs(new_complex_row)
-        new_phase_row = np.angle(new_complex_row)
-
-        # 3. 颜色初始化逻辑
-        if count == 0:
-            count = 1
-            raw_len = len(csi_raw_data)
-            if csi_data_len == 106:
-                colors = generate_subcarrier_colors((0,25), (27,53), None, sub_len)
-            elif csi_data_len == 114:
-                colors = generate_subcarrier_colors((0,27), (29,56), None, sub_len)
-            elif csi_data_len == 52:
-                colors = generate_subcarrier_colors((0,12), (13,26), None, sub_len)
-            elif csi_data_len == 234 :
-                colors = generate_subcarrier_colors((0,28), (29,56), (60,116), sub_len)
-            elif csi_data_len == 228 :
-                colors = generate_subcarrier_colors((0,28), (29,57), (57,113), sub_len)
-            elif csi_data_len == 490 :
-                colors = generate_subcarrier_colors((0,61), (62,122), (123,245), sub_len)
-            elif csi_data_len == 128 :
-                colors = generate_subcarrier_colors((0,31), (32,63), None, sub_len)
-            elif csi_data_len == 256 :
-                colors = generate_subcarrier_colors((0,32), (32,63), (64,128), sub_len)
-            elif csi_data_len == 512 :
-                colors = generate_subcarrier_colors((0,63), (64,127), (128,256), sub_len)
-            elif csi_data_len == 384 :
-                colors = generate_subcarrier_colors((0,63), (64,127), (128,192), sub_len)
-            elif 0 < csi_data_len <= 612:
-                colors = generate_subcarrier_colors((0,raw_len//2), (raw_len//2+1,raw_len-1), None, sub_len)
-            else:
-                colors = [(200,200,200)] * sub_len
-            
-            with data_lock:
-                current_colors = colors
-                current_data_len = sub_len
-
-        # 4. 加锁更新全局历史数组
-        with data_lock:
-            csi_amplitude_history[:-1] = csi_amplitude_history[1:]
-            csi_amplitude_history[-1, :sub_len] = new_amp_row
-
-            csi_phase_history[:-1] = csi_phase_history[1:]
-            csi_phase_history[-1, :sub_len] = new_phase_row
-
-            csi_complex_latest[:sub_len] = new_complex_row
-            
-            agc_history[:-1] = agc_history[1:]
-            agc_history[-1] = agc_gain
-            
-            fft_history[:-1] = fft_history[1:]
-            fft_history[-1] = fft_gain
 
     ser.close()
 
@@ -310,16 +362,18 @@ class SubThread(QThread):
     def __init__(self, serial_port, save_file_name, log_file_name):
         super().__init__()
         self.serial_port = serial_port
-        save_file_fd = open(save_file_name, 'w', newline='')
+        self.save_file_fd = open(save_file_name, 'w', newline='')
         self.log_file_fd = open(log_file_name, 'w')
-        self.csv_writer = csv.writer(save_file_fd)
-        self.csv_writer.writerow(DATA_COLUMNS_NAMES)
+        self.csv_writer = csv.writer(self.save_file_fd)
+        # 写入表头
+        self.csv_writer.writerow(['index', 'len', 'data'])
 
     def run(self):
         csi_data_read_parse(self.serial_port, self.csv_writer, self.log_file_fd)
 
     def __del__(self):
         self.wait()
+        self.save_file_fd.close()
         self.log_file_fd.close()
 
 
